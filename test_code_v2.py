@@ -16,7 +16,7 @@ from openai import OpenAI
 import pyaudio
 
 client = OpenAI(
-    api_key="sk-3e9cf6e6052a4c7dba9dd02bc30bd529",
+    api_key="sk-3e9cf11111111111111111116e6052a4c2227dba9dd02bc30bd529",
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 context_len = 10 # s video
