@@ -12,29 +12,32 @@ import os
 import ffmpeg
 
 import soundfile as sf
-
 from openai import OpenAI
 import pyaudio
 
 client = OpenAI(
-    api_key="sk-3e9cf6e6052a4c7dba9dd02bc30bd529",
+    api_key="sk-3e9cf6e605ewee2a4c7dba9dd02b33333333332222222222222c30bd529",
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
-context_len = 10 #s
+context_len = 10 # s video
 class OpenAI4oStream:
     def __init__(self, api_key, max_frames=context_len):
         self.api_key = api_key
         self.max_frames = max_frames
         self.video_queue = Queue(maxsize=max_frames)
-        self.audio_queue = Queue(maxsize= max_frames * 16)
-        self.audio_out_queue = Queue(maxsize= max_frames * 16)
-        self.buffer = bytearray()  # 动态缓冲区
+        self.audio_queue = Queue(maxsize=max_frames * 16)
+        self.audio_out_queue = Queue(maxsize=max_frames * 16)
+        self.buffer = np.empty(10240000, dtype=np.int16) ## for voice output
+        self.lock = threading.Lock()  # 创建锁
+        self.current_size = 0  ## location of write voice buffer
+        self.play_size = 0      ##location of play voice buffer
         self.stop_event = threading.Event()
         
 
     def capture_video(self, camera_index=0):
         """从摄像头捕获视频帧"""
         frame_id=0
+        frames_save = 30  ### 抽帧 1s 一帧
         cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
             raise ValueError("无法打开摄像头")
@@ -49,8 +52,9 @@ class OpenAI4oStream:
             frame = cv2.resize(frame, (640, 480))
             frame_id = frame_id + 1
             # 将帧放入队列，如果队列满则丢弃最旧的帧
-            if frame_id % 30 == 0:
-                print("frame_id====",frame_id)
+
+            if frame_id % frames_save == 0:
+                print("frame_id====",frame_id/30)
                 if self.video_queue.full():
                     print("video queue ....full,,remove the oldest frame")
                     self.video_queue.get_nowait()
@@ -84,7 +88,7 @@ class OpenAI4oStream:
                         input=True,
                         frames_per_buffer=CHUNK)
 
-        print("****** 开始录音 ******")
+        print("****** 开始采集 video with audio ******")
         audio_frame_id = 0
         while not self.stop_event.is_set():
             data = stream.read(CHUNK)
@@ -116,39 +120,30 @@ class OpenAI4oStream:
         RATE = 24000
 
         p = pyaudio.PyAudio()
-
-
         stream = p.open(format=p.get_format_from_width(2),
                         channels=CHANNELS,
                         rate=RATE,
                         output=True)
 
-        print("****** 开始 OUTPUT audio ******")
+        #print("****** 开始 OUTPUT audio ******")
 
         while not self.stop_event.is_set():
-            print("33333333ddddddddddddddd")
         
             try:
-                # 从队列获取音频块 (阻塞直到有数据)
-                audio_chunk = self.audio_out_queue.get(timeout=50.0)
-                # 检查是否为结束信号
-                print("yyyyyyyyyyyyy")
-                print(len(audio_chunk))
-                if audio_chunk is None:
-                    print("读取shuju为空")
-                    break
-                # 播放音频块
+                with self.lock:
+                    play_context = self.current_size
+                while self.play_size + 1024*16 < play_context:
+                    audio_chunk = self.buffer[self.play_size:play_context]
+                    play_len =len(audio_chunk)
+                    stream.write(audio_chunk)
+                    self.play_size = self.play_size + play_len
+                time.sleep(1)
 
-                stream.write(audio_chunk)
-            except queue.Empty:
-                print("音频队列为空，等待超时")
-                break
             except Exception as e:
                 print(f"播放错误: {e}")
                 break
-
-            print("ccccccccccccccccccccccccccccccc")
-        print("****** 停止录音 ******")
+            time.sleep(1)
+        print("****** 停止播放 ******")
 
         time.sleep(20)
 
@@ -158,7 +153,6 @@ class OpenAI4oStream:
 
     def process_stream(self, prompt="描述这个场景"):
         """处理音视频流并发送到 OpenAI 4o API"""
-
 
         # 创建临时文件存储视频
         with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as f:
@@ -227,11 +221,13 @@ class OpenAI4oStream:
     def _send_to_openai(self, video_path, audio_path, prompt):
         """将视频和音频发送到 OpenAI API"""
 
+        start_time_turn = time.perf_counter()
         try:
             import pyaudio
         except ImportError:
             print("需要安装 pyaudio 库来捕获音频")
             return
+
 
         try:
             video_stream = ffmpeg.input(video_path)
@@ -264,11 +260,16 @@ class OpenAI4oStream:
                 print(f"已保存原始视频至: {"./demo.mp4"} (无音频)")
 
 
-        print("afte ... merge .........")
+        #print("afte ... merge .........")
         with open("./demo.mp4", "rb") as f:
             video_data_out = f.read()
             video_base64_out = base64.b64encode(video_data_out).decode('utf-8')
     
+        end_time = time.perf_counter()
+            # 计算执行时间
+        execution_time = end_time - start_time_turn
+        print(f"process ...total代码执行时间: {execution_time:.6f} 秒")
+            #time.sleep(1)
 
         messages = [
             {
@@ -309,43 +310,36 @@ class OpenAI4oStream:
 
         for chunk in completion:
             count = count + 1
-            if count == 1:
-                end_time = time.perf_counter()
-                # 计算执行时间
-                execution_time = end_time - start_time
-                print(f"第一个chunk 从送video 到输出代码执行时间: {execution_time:.6f} 秒")
+
 
             if chunk.choices:
                 if hasattr(chunk.choices[0].delta, "audio"):
                     try:
                         audio_string += chunk.choices[0].delta.audio["data"]
                         audio_data=chunk.choices[0].delta.audio["data"]
-                        """向队列添加音频块 (audio_data应为numpy数组)"""
-                        '''
-                        try:
-                            wav_bytes = base64.b64decode(audio_data)
-                            wav_array = np.frombuffer(wav_bytes, dtype=np.int16)
-                            self.audio_out_queue.put_nowait(wav_array)
-                            print("dddd..... wav_array:",len(wav_array))
-                        except queue.Full:
-                            print("警告: 音频队列已满，丢弃 oldest chunk")
-                            # 移除最早的块并添加新块
-                            self.audio_out_queue.get_nowait()
-                            self.audio_out_queue.put_nowait(wav_array)
-                        '''
-                    except Exception as e:
-                        text.append(chunk.choices[0].delta.audio["transcript"])
+                        wav_bytes = base64.b64decode(audio_data)
+                        wav_array = np.frombuffer(wav_bytes, dtype=np.int16)
+                        chunk_len = len(wav_array)
+
+                        '''  
+                        print(count)
                         end_time = time.perf_counter()
                         # 计算执行时间
-                        execution_time = end_time - chunk_end_time
-                        #print("chunk output:",chunk.choices[0].delta.audio["transcript"])
-                        #print(f"current chunk 代码执行时间: {execution_time:.6f} 秒")
+                        execution_time = end_time - start_time
+                        print(f"第一个chunk 从送video 到输出第一个audio执行时间: {execution_time:.6f} 秒")
+                        '''
+                        
+                        self.buffer[self.current_size:self.current_size + chunk_len] = wav_array
+                        with self.lock:
+                            self.current_size = self.current_size + chunk_len
+
+                    except Exception as e:
+                        text.append(chunk.choices[0].delta.audio["transcript"])
+
             else:
                 print(chunk.usage)
 
             chunk_end_time = time.perf_counter()
-
-
 
 
         import soundfile as sf
@@ -355,23 +349,7 @@ class OpenAI4oStream:
         print("".join(text))
         end_time = time.perf_counter()
         execution_time = end_time - start_time
-        print(f"第一个chunk 从送video 到所有结果获得: {execution_time:.6f} 秒")
-
-        wav_bytes = base64.b64decode(audio_string)
-        wav_array = np.frombuffer(wav_bytes, dtype=np.int16)
-        sf.write("./output.wav", wav_array, samplerate=24000)
-
-        try:
-           # wav_bytes = base64.b64decode(audio_data)
-           # wav_array = np.frombuffer(wav_bytes, dtype=np.int16)
-            self.audio_out_queue.put_nowait(wav_array)
-            print("dddd..... wav_array:", len(wav_array))
-        except queue.Full:
-            print("警告: 音频队列已满，丢弃 oldest chunk")
-            # 移除最早的块并添加新块
-            self.audio_out_queue.get_nowait()
-            self.audio_out_queue.put_nowait(wav_array)
-
+        #print(f"第一个chunk 从送video 到所有结果获得: {execution_time:.6f} 秒")
         
         return "Success"
 
@@ -391,7 +369,6 @@ class OpenAI4oStream:
         self.audio_thread.daemon = True
         self.audio_thread.start()
 
-
         # 启动音频捕获线程
 
         self.audio_out_thread = threading.Thread(target=self.output_audio)
@@ -407,48 +384,16 @@ class OpenAI4oStream:
             self.video_thread.join(timeout=2.0)
         if hasattr(self, 'audio_thread'):
             self.audio_thread.join(timeout=2.0)
+        if hasattr(self, 'audio_out_thread'):
+            self.audio_out_thread.join(timeout=2.0)
 
 
 
 # 使用示例
 if __name__ == "__main__":
 
-    API_KEY = "3e9cf6e6052a4c7dba9dd02bc30bd529"  # 替换为你的 API 密钥
+    API_KEY = "3e9cf6e6052a4c7dba9dd02bc30bd529"  # 替换为你的 qwen API 密钥
     stream_processor = OpenAI4oStream(api_key=API_KEY)
-
-    '''
-    import wave
-    import pyaudio
-
-    # 要播放的 WAV 文件路径
-    file_path = "./test_out.wav"
-
-    # 打开 WAV 文件
-    wf = wave.open(file_path, 'rb')
-    # 初始化 PyAudio
-    p = pyaudio.PyAudio()
-
-    # 打开
-    stream = p.open(format=p.get_format_from_width(wf.getsampwidth()),
-                    channels=wf.getnchannels(),
-                    rate=wf.getframerate(),
-                    output=True)
-
-    # 读取数据并播放
-    data = wf.readframes(1024)
-    while data:
-        stream.write(data)
-        data = wf.readframes(1024)
-
-    # 停止数据流
-    stream.stop_stream()
-    stream.close()
-
-    # 关闭 PyAudio
-    p.terminate()
-    print("kkkkkkkkkkkkkkkkkkkk")
-    exit()
-    '''
 
     try:
 
@@ -457,13 +402,14 @@ if __name__ == "__main__":
         print("正在收集音视频数据...")
         time.sleep(context_len+3)
 
-
         while True:
             start_time_turn = time.perf_counter()
             response = stream_processor.process_stream("start the test flow")
+            '''
             if response:
                 print("API 响应:")
                 print(response)
+            '''
 
             end_time = time.perf_counter()
             # 计算执行时间
