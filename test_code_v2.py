@@ -16,7 +16,7 @@ from openai import OpenAI
 import pyaudio
 
 client = OpenAI(
-    api_key="sk-3e9cf6e605ewee2a4c7dba9dd02b33333333332222222222222c30bd529",
+    api_key="sk-3e9cf6e6052a4c7dba9dd02bc30bd529",
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 context_len = 10 # s video
@@ -26,11 +26,6 @@ class OpenAI4oStream:
         self.max_frames = max_frames
         self.video_queue = Queue(maxsize=max_frames)
         self.audio_queue = Queue(maxsize=max_frames * 16)
-        self.audio_out_queue = Queue(maxsize=max_frames * 16)
-        self.buffer = np.empty(10240000, dtype=np.int16) ## for voice output
-        self.lock = threading.Lock()  # 创建锁
-        self.current_size = 0  ## location of write voice buffer
-        self.play_size = 0      ##location of play voice buffer
         self.stop_event = threading.Event()
         
 
@@ -104,52 +99,6 @@ class OpenAI4oStream:
         stream.close()
         p.terminate()
 
-    def output_audio(self):
-        """捕获音频流（需要安装 pyaudio）"""
-        try:
-            import pyaudio
-            import wave
-        except ImportError:
-            print("需要安装 pyaudio 库来捕获音频")
-            return
-
-        time.sleep(10)
-        CHUNK = 1024
-        FORMAT = pyaudio.paInt16
-        CHANNELS = 1
-        RATE = 24000
-
-        p = pyaudio.PyAudio()
-        stream = p.open(format=p.get_format_from_width(2),
-                        channels=CHANNELS,
-                        rate=RATE,
-                        output=True)
-
-        #print("****** 开始 OUTPUT audio ******")
-
-        while not self.stop_event.is_set():
-        
-            try:
-                with self.lock:
-                    play_context = self.current_size
-                while self.play_size + 1024*16 < play_context:
-                    audio_chunk = self.buffer[self.play_size:play_context]
-                    play_len =len(audio_chunk)
-                    stream.write(audio_chunk)
-                    self.play_size = self.play_size + play_len
-                time.sleep(1)
-
-            except Exception as e:
-                print(f"播放错误: {e}")
-                break
-            time.sleep(1)
-        print("****** 停止播放 ******")
-
-        time.sleep(20)
-
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
 
     def process_stream(self, prompt="描述这个场景"):
         """处理音视频流并发送到 OpenAI 4o API"""
@@ -286,7 +235,17 @@ class OpenAI4oStream:
                 ],
             },
         ]
+
         start_time = time.perf_counter()
+        
+        import pyaudio
+        p = pyaudio.PyAudio()
+        # # 创建音频流
+        stream = p.open(format=pyaudio.paInt16,
+                         channels=1,
+                         rate=24000,
+                         output=True)
+
 
         # Qwen-Omni only supports stream mode
         completion = client.chat.completions.create(
@@ -320,7 +279,7 @@ class OpenAI4oStream:
                         wav_bytes = base64.b64decode(audio_data)
                         wav_array = np.frombuffer(wav_bytes, dtype=np.int16)
                         chunk_len = len(wav_array)
-
+                        stream.write(wav_array.tobytes())
                         '''  
                         print(count)
                         end_time = time.perf_counter()
@@ -328,11 +287,6 @@ class OpenAI4oStream:
                         execution_time = end_time - start_time
                         print(f"第一个chunk 从送video 到输出第一个audio执行时间: {execution_time:.6f} 秒")
                         '''
-                        
-                        self.buffer[self.current_size:self.current_size + chunk_len] = wav_array
-                        with self.lock:
-                            self.current_size = self.current_size + chunk_len
-
                     except Exception as e:
                         text.append(chunk.choices[0].delta.audio["transcript"])
 
@@ -369,14 +323,6 @@ class OpenAI4oStream:
         self.audio_thread.daemon = True
         self.audio_thread.start()
 
-        # 启动音频捕获线程
-
-        self.audio_out_thread = threading.Thread(target=self.output_audio)
-        self.audio_out_thread.daemon = True
-        self.audio_out_thread.start()
-        
-        
-
     def stop(self):
         """停止所有线程"""
         self.stop_event.set()
@@ -384,9 +330,6 @@ class OpenAI4oStream:
             self.video_thread.join(timeout=2.0)
         if hasattr(self, 'audio_thread'):
             self.audio_thread.join(timeout=2.0)
-        if hasattr(self, 'audio_out_thread'):
-            self.audio_out_thread.join(timeout=2.0)
-
 
 
 # 使用示例
